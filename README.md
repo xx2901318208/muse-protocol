@@ -1,8 +1,8 @@
 # muse.ai 注册 / 邀请码兑换 协议分析
 
-补充一下，记得用JP 节点， JP 不需要绑卡，直接过
-
 纯 HTTP 实现 muse.ai 的注册与邀请码兑换流程，不依赖浏览器。本文记录的是通过抓包逐字段比对得出的协议细节。
+
+> 节点提示：实测用日本（JP）出口节点注册不需要绑卡，直接过；其他地区可能触发地区受限（见下文 `region_waitlist`）。
 
 ## 快速开始
 
@@ -12,6 +12,16 @@ cp config.example.json config.json   # 填入邮箱与可选代理
 python example_register.py
 ```
 
+## 开发 / 测试
+
+```bash
+pip install -e ".[dev]"   # 含 pytest、ruff
+python -m pytest -q        # 离线测试，不联网：15 个冒烟 + 11 个回归
+ruff check .
+```
+
+推送和 PR 会自动跑 CI（Python 3.11 / 3.12）。
+
 ## 目录结构
 
 ```
@@ -19,6 +29,7 @@ musepy/
   client.py    注册 + 兑换的完整协议客户端
   runner.py    多账号批量调度（sticky 代理 / 预算 / 停止语义）
   otp.py       验证码轮询（幂等：只取 send 之后的最新码）
+  temp_mail.py generator.email 临时邮箱：生成新邮箱 + 从收件箱读验证码
   falco.py     行为埋点上报（可选）
   caa.py       注册漏斗事件上报（可选）
 example_register.py        单账号端到端示例
@@ -26,7 +37,13 @@ example_batch.py           多账号批量示例
 config.example.json        配置模板
 test_onboarding_smoke.py   离线冒烟（披露解析纯函数）
 test_runner_smoke.py       离线冒烟（批量调度，mock 网络）
+test_fixes.py              回归测试（waterfall / redeem / wake / 代理 / OTP 重试）
+pyproject.toml             打包、pytest、ruff 配置
+.github/workflows/ci.yml   CI：ruff + pytest（3.11 / 3.12）
 ```
+
+注意 `example_register.py` 的 `otp_file` 是“只含一个 6 位验证码”的文件，
+别和批量模式的 `otp_file`（`email----otp源URL` 清单）搞混。
 
 ## 协议流程
 
@@ -157,6 +174,47 @@ own_code/own_code_status/reveal_status/is_revealed/ip/last_error`。
 
 OTP 轮询幂等：每次 `send_otp` 前记录开始时间，`musepy/otp.py` 只取该时间之后的
 最新 6 位验证码（45 秒超时、0.6 秒间隔、单请求 15 秒超时）。
+
+## 临时邮箱自动注册（musepy/temp_mail.py）
+
+不想准备邮箱清单时，可以让程序从 [generator.email](https://generator.email/inbox1/)
+自动生成新邮箱、自动从收件箱读验证码，全程不用手动输码：
+
+```bash
+# 单账号：config.json 里 temp_mail=true（或把 email 留空），其余不变
+python example_register.py
+
+# 批量：config.json 里 temp_mail=true，otp_file 不再需要
+python example_batch.py 10
+```
+
+机制（`musepy/temp_mail.py`）：
+
+- 生成：`GET /search.php?key=<随机 2 字符>` 取域名池，随机拼一个
+  `local@domain`。**实测提醒（2026-11-17）：`search.php` 当天对裸请求
+  返回 403、无 JSON**，拿不到时用代码里 `FALLBACK_DOMAINS`（当天页面
+  下拉框里看到的 15 个域名）兜底；域名失效请用配置 `temp_mail_domains`
+  指定新域名。更关键的是，当天实测页面是**会话标识邮箱**（`/{email}`
+  会重定向到 `/inboxN/`，浏览器里看不到 `embx`/`surl` Cookie 和加载
+  消息的接口），所以下面这套 Cookie 认邮箱的机制在当前 live 站上是
+  **未证实的**——按旧版公开实现先写着，能不能收到码要以实测为准，
+  收不到就回退到 `otp_file` 手动邮箱模式。
+- 认邮箱：`GET /inbox1/` 靠 Cookie，`embx=["<邮箱>"]` + `surl=<域名>/<local>`；
+  inbox1 取不到时兜底试 `GET /<完整邮箱>`。
+- 读码：收件箱返回的是 HTML 不是 JSON，所以去标签转纯文本再找 6 位码；
+  生成后先快照一次收件箱，`send_otp` 后只认快照外的新码，同一轮多个
+  不同新码视为歧义、不猜。默认轮询 120 秒、3 秒一次（`temp_mail_timeout` 可调）。
+- 刷新 / 切换：`GeneratorMail.refresh()` 就是重新拉一遍收件箱（网站上的
+  刷新按钮）；`switch_to_new_email()` 换一个全新邮箱（旧邮箱直接丢弃，
+  Cookie 已更新），`switch_to_email(addr)` 切换到指定地址。
+  单账号和批量在 OTP 等超时后都会自动切换：`temp_mail_max_switches`
+  默认 2，即 1 个初始邮箱 + 最多 2 次切换，换邮箱后从 `restart` 重新
+  走全程；2 次都等不到码才判超时、停批，不会无限换下去。
+
+注意：这是公开临时邮箱，谁拿到地址谁就能读收件箱，只适合收一次性验证码，
+别用它收敏感邮件。读 generator.email 收件箱本身默认直连（单账号示例会
+把配置里的 `proxy` 也传给临时邮箱；批量模式目前直连，如需走代理请改
+`runner.py` 里 `make_otp_waiter` / `generate_email` 的 `proxy` 参数）。
 
 ## 埋点说明
 
