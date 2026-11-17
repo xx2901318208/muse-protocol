@@ -29,7 +29,7 @@ def _row(row_id, payload):
     return row_id + ":" + json.dumps(payload) + "\n"
 
 
-def case_normal():
+def test_normal():
     status = {"result": "success", "resolvedDestination": "main_app",
               "status": {"isGeoGated": False, "hasHatchAccess": True, "waitlistStatus": None}}
     disclosure = {"disclosureText": "次に進むことで同意します。", "disclosureVersion": "HATCH_ROW_v0"}
@@ -42,7 +42,7 @@ def case_normal():
     assert out["is_geo_gated"] is False and out["has_hatch_access"] is True, out
 
 
-def case_waitlist():
+def test_waitlist():
     status = {"result": "success", "resolvedDestination": "waitlist",
               "status": {"isGeoGated": False, "hasHatchAccess": False, "waitlistStatus": "pending"}}
     doc = _html(_row("a1b2", status),
@@ -53,7 +53,7 @@ def case_waitlist():
     assert out["waitlist_status"] == "pending", out
 
 
-def case_geo_gated():
+def test_geo_gated():
     status = {"result": "success", "resolvedDestination": "main_app",
               "status": {"isGeoGated": True, "hasHatchAccess": False, "waitlistStatus": None}}
     doc = _html(_row("aa11", status),
@@ -63,7 +63,7 @@ def case_geo_gated():
     assert out["is_geo_gated"] is True, out
 
 
-def case_conflict():
+def test_conflict():
     doc = _html(
         _row("1a2b", {"disclosureText": "版本A的正文", "disclosureVersion": "HATCH_ROW_v0"}),
         _row("3c4d", {"disclosureText": "版本B的正文", "disclosureVersion": "HATCH_ROW_v0"}),
@@ -72,13 +72,13 @@ def case_conflict():
     assert out["state"] == "unresolved", out
 
 
-def case_missing():
+def test_missing():
     doc = _html(_row("1a2b", {"unrelated": True}))
     out = parse_onboarding(doc)
     assert out["state"] == "unresolved", out
 
 
-def case_unknown_version():
+def test_unknown_version():
     doc = _html(_row("1a2b", {"disclosureText": "正文", "disclosureVersion": "HATCH_UNKNOWN_v9"}))
     out = parse_onboarding(doc)
     assert out["state"] == "unresolved", out
@@ -86,9 +86,9 @@ def case_unknown_version():
 
 
 def main():
-    tests = [("normal_disclosure", case_normal), ("waitlist", case_waitlist),
-             ("geo_gated", case_geo_gated), ("disclosure_conflict", case_conflict),
-             ("disclosure_missing", case_missing), ("unknown_version", case_unknown_version)]
+    tests = [("normal_disclosure", test_normal), ("waitlist", test_waitlist),
+             ("geo_gated", test_geo_gated), ("disclosure_conflict", test_conflict),
+             ("disclosure_missing", test_missing), ("unknown_version", test_unknown_version)]
     for name, fn in tests:
         fn()
         print(f"[PASS] {name}")
