@@ -9,6 +9,12 @@
 - region_waitlist：账号已注册但地区受限——记录 registered_waitlist（账号保留）并停止。
 - 预算 = 领取的不同邮箱数，失败不补号。
 
+邮箱来源两种（二选一，见 init）：
+  1. otp_file 清单：每行 email----otp源URL，OTP 从该 URL 轮询；
+  2. temp_mail 自动生成：config 里 temp_mail=true 时，init(count) 直接
+     从 generator.email 生成 count 个新邮箱，每个邮箱的 OTP 从它自己
+     的收件箱轮询，不再需要 otp_file。
+
 每账号结果写入 output_dir/<email>.json（简化字段）。frl_access_token 与
 hatch_sess 仅在内存中使用，不落盘。仅供个人学习与研究使用。
 """
@@ -22,7 +28,9 @@ from datetime import datetime, timezone
 
 from . import caa as _caa
 from . import otp as _otp
+from . import temp_mail as _temp_mail
 from .client import MuseClient, MuseError, random_dob
+import contextlib
 
 PRE_SEND_STAGES = frozenset({"initialized", "bootstrap", "restart"})
 AUTH_STAGES = PRE_SEND_STAGES | {"send_otp", "wait_otp", "confirm_otp", "completion"}
@@ -52,20 +60,50 @@ def _lines(path):
 
 
 def mkproxy(line):
-    """host:port:user:pass → http://user:pass@host:port；host:port → http://host:port"""
-    parts = (line or "").split(":")
+    """host:port:user:pass → http://user:pass@host:port；host:port → http://host:port。
+
+    也接受已是完整 URL 的行（http://user:pass@host:port）。
+    之前用 line.split(":") 且要求正好 4 段：密码里带冒号会被截断成
+    ValueError，IPv6 地址更是直接解析错。这里按“最多切 3 次”处理，
+    密码保留剩余全部内容，并对 user/password 做 URL 编码。
+    """
+    from urllib.parse import quote, urlsplit
+
+    raw = (line or "").strip()
+    if raw.startswith(("http://", "https://")):
+        return raw
+    parts = raw.split(":", 3)
     if len(parts) == 4:
         host, port, user, password = parts
-        return f"http://{user}:{password}@{host}:{port}"
+        return f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}"
     if len(parts) == 2:
         host, port = parts
+        # [::1]:port 这种 IPv6 行 split(":") 会碎掉，走 urlsplit 兜底
+        if raw.startswith("["):
+            hostport = urlsplit("//" + raw)
+            if hostport.hostname and hostport.port:
+                return f"http://{raw}"
         return f"http://{host}:{port}"
+    if raw.startswith("["):
+        hostport = urlsplit("//" + raw)
+        if hostport.hostname and hostport.port:
+            return f"http://{raw}"
     raise ValueError("proxy_line_format")
 
 
 def proxy_endpoint(line):
     """仅取 host:port，用于日志（不打印凭据）。"""
-    parts = (line or "").split(":")
+    from urllib.parse import urlsplit
+
+    raw = (line or "").strip()
+    if raw.startswith(("http://", "https://")):
+        parsed = urlsplit(raw)
+        return parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+    if raw.startswith("["):
+        parsed = urlsplit("//" + raw)
+        if parsed.hostname:
+            return parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+    parts = raw.split(":", 3)
     return f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else None
 
 
@@ -99,6 +137,13 @@ class BatchRunner:
         self.tried_file = config.get("tried_file")
         self.send_caa = bool(config.get("send_caa", False))
         self.resolve_ip = bool(config.get("resolve_ip", True))
+        # 临时邮箱：temp_mail=true 时不用 otp_file，init 直接生成新邮箱
+        self.temp_mail = bool(config.get("temp_mail", False))
+        self.temp_mail_timeout = int(config.get("temp_mail_timeout", 120) or 120)
+        self.temp_mail_max_switches = int(config.get("temp_mail_max_switches", 2) or 0)
+        self.temp_mail_domains = config.get("temp_mail_domains") or None
+        self._temp_seen = {}  # email -> 生成时收件箱已有的码快照（去重用）
+        self.email_generator = None  # 注入点（离线测试用）：() -> (email, seen_before)
         # 注入点（离线测试用）：客户端工厂 / OTP 轮询 / 出口 IP 解析
         self.client_factory = client_factory or self._default_client_factory
         self.otp_waiter = otp_waiter or self._default_otp_waiter
@@ -119,8 +164,14 @@ class BatchRunner:
     def _default_client_factory(self, proxy_url):
         return MuseClient(proxy=proxy_url, impersonate=self.fp, lang=self.lang)
 
-    @staticmethod
-    def _default_otp_waiter(email, url, after):
+    def _default_otp_waiter(self, email, url, after):
+        # generator: 开头的行是临时邮箱：OTP 从它自己的收件箱轮询，
+        # 不走 otp_file 的 JSON 源；其余行保持原有 _otp.wait_otp 行为。
+        if isinstance(url, str) and url.startswith("generator:"):
+            waiter = _temp_mail.make_otp_waiter(
+                email, impersonate=self.fp, timeout=self.temp_mail_timeout,
+                seen_before=self._temp_seen.get(email, ()))
+            return waiter(email, url, after)
         return _otp.wait_otp(url, after)
 
     @staticmethod
@@ -133,20 +184,49 @@ class BatchRunner:
 
     # ---------- 池加载（预算 = count 个不同邮箱） ----------
 
+    def _generate_temp_rows(self, count):
+        """生成 count 个临时邮箱：{email: "generator:<email>"}。
+
+        每个邮箱生成后立刻快照一次收件箱（正常应为空），快照里的码
+        在后续 wait_otp 里会被排除，避免把生成前就有的旧码当本次 OTP。
+        生成失败（域名拿不到等）直接抛 TempMailError，init 不补号、
+        不 fallback 到 otp_file——两种来源混用只会让排错更难。
+        """
+        rows, seen = {}, {}
+        for _ in range(count):
+            if self.email_generator is not None:
+                email, snapshot = self.email_generator()
+            else:
+                email, mail = _temp_mail.generate_email(
+                    domains=self.temp_mail_domains, impersonate=self.fp)
+                try:
+                    snapshot = tuple(mail.fetch_codes())
+                except Exception:
+                    snapshot = ()
+                finally:
+                    mail.close()
+            rows[email] = f"generator:{email}"
+            seen[email] = tuple(snapshot or ())
+        return rows, seen
+
     def init(self, count=30):
         """加载邮箱/代理/验证码池。失败不补号；已在 tried_file 的邮箱跳过。"""
         count = int(count)
         if count < 1:
             raise ValueError("count_must_be_positive")
-        rows = {}
-        for line in _lines(self.otp_file or ""):
-            if "----" not in line:
-                continue
-            email, url = line.split("----", 1)
-            email = email.strip()
-            if not email or any(ch in email for ch in "/\\:\x00"):
-                continue  # 非法记录名，直接跳过
-            rows[email] = url.strip()
+        if self.temp_mail:
+            rows, seen = self._generate_temp_rows(count)
+            self._temp_seen = seen
+        else:
+            rows = {}
+            for line in _lines(self.otp_file or ""):
+                if "----" not in line:
+                    continue
+                email, url = line.split("----", 1)
+                email = email.strip()
+                if not email or any(ch in email for ch in "/\\:\x00"):
+                    continue  # 非法记录名，直接跳过
+                rows[email] = url.strip()
         tried = (set(_lines(self.tried_file))
                  if self.tried_file and os.path.exists(self.tried_file) else set())
         proxies = _lines(self.proxy_file or "")
@@ -220,8 +300,11 @@ class BatchRunner:
         池耗尽或全部校验失败时：先复用自己的当前行，再找未占用行，
         最后才共享（打日志）。avoid 排除刚换掉的行（达 max_per_ip 后）。
         """
-        for _ in range(400):
-            line = random.choice(self.PX)
+        # 之前是 400 次 random.choice 碰运气：池子一大、坏行一多就白转很多圈，
+        # 还可能 400 次都撞上已占用行。改成洗牌后顺序遍历，每行最多校验一次。
+        candidates = list(self.PX)
+        random.shuffle(candidates)
+        for line in candidates:
             if line in self._pool_bad or line == avoid:
                 continue
             if line != current:
@@ -324,7 +407,7 @@ class BatchRunner:
         if stop:
             self.request_stop("authentication_paused" if stage in AUTH_STAGES
                               else "workflow_paused")
-        return outcome, {"stage": stage, "status": status,
+        return outcome, {"stage": stage, "status": status, "email": rec.get("email"),
                          "registered": bool(rec.get("registered")), "reason": reason}
 
     # ---------- 单账号全链（顺序对齐本地实现） ----------
@@ -346,25 +429,59 @@ class BatchRunner:
                 return self._finish(email, rec, "failed", "otp_source_missing", stage)
             client = self.client_factory(mkproxy(proxy_line))
             caa = _caa.Caa(client.fp, client.lang) if self.send_caa else None
-            stage = "bootstrap"
-            client.open_home()
-            if caa:
-                caa.page_shown(client.s)
-                caa.focus(client.s)
-                caa.continue_clicked(client.s)
-            stage = "restart"
-            client.restart()
-            if caa:
-                caa.registration_start(client.s)
-            stage = "send_otp"
-            client.send_otp(email)
-            sent_at = utc_stamp()
-            if caa:
-                caa.otp_typed(client.s)
-            stage = "wait_otp"
-            otp_code = self.otp_waiter(email, self.ROWS.get(email), sent_at)
-            if not otp_code:
-                return self._finish(email, rec, "pending", "otp_wait_timeout", stage)
+            if caa is not None and hasattr(client, "waterfall_id"):
+                # 漏斗 id 全程同一个：client 的 X-Hatch-Waterfall-Id 与
+                # caa 事件的 waterfall_id 对齐，否则服务端看到两条断裂的漏斗。
+                client.waterfall_id = caa.wid
+            # 拿验证码阶段（可切换邮箱重试）：临时邮箱等不到码时，换一个
+            # 新邮箱、从 bootstrap 重新走一遍；手动邮箱 / otp_file 模式
+            # 没有“换邮箱”这一说，只试一次。temp_mail_max_switches 默认 2。
+            is_temp = (self.temp_mail
+                       and isinstance(self.ROWS.get(email), str)
+                       and self.ROWS.get(email).startswith("generator:"))
+            max_switches = self.temp_mail_max_switches if is_temp else 0
+            otp_code = None
+            for attempt in range(max_switches + 1):
+                stage = "bootstrap"
+                client.open_home()
+                if caa:
+                    caa.page_shown(client.s)
+                    caa.focus(client.s)
+                    caa.continue_clicked(client.s)
+                stage = "restart"
+                client.restart()
+                if caa:
+                    caa.registration_start(client.s)
+                stage = "send_otp"
+                client.send_otp(email)
+                sent_at = utc_stamp()
+                if caa:
+                    caa.otp_typed(client.s)
+                stage = "wait_otp"
+                otp_code = self.otp_waiter(email, self.ROWS.get(email), sent_at)
+                if otp_code:
+                    break
+                if attempt >= max_switches:
+                    return self._finish(email, rec, "pending", "otp_wait_timeout", stage)
+                # 切换：旧邮箱丢弃（临时邮箱一次性的），换新邮箱重走全程。
+                # 新邮箱记进 ROWS / _temp_seen，记录文件最终按新邮箱落盘。
+                old_email = email
+                if self.email_generator is not None:
+                    email, snapshot = self.email_generator()
+                else:
+                    email, mail = _temp_mail.generate_email(
+                        domains=self.temp_mail_domains, impersonate=self.fp)
+                    try:
+                        snapshot = tuple(mail.fetch_codes())
+                    except Exception:
+                        snapshot = ()
+                    finally:
+                        mail.close()
+                self.ROWS[email] = f"generator:{email}"
+                self._temp_seen[email] = tuple(snapshot or ())
+                rec["email"] = email
+                print(f"  [i] {old_email} 没收到码，已切换到新邮箱 {email}",
+                      flush=True)
             if caa:
                 caa.otp_success(client.s)
                 caa.birthday_start(client.s)
@@ -423,10 +540,8 @@ class BatchRunner:
             return self._finish(email, rec, _classify_error(exc), type(exc).__name__, stage)
         finally:
             if client is not None:
-                try:
+                with contextlib.suppress(Exception):
                     client.close()
-                except Exception:
-                    pass
 
     # ---------- worker ----------
 
@@ -445,6 +560,9 @@ class BatchRunner:
                 proxy_line, _ = self._pick_proxy(current=None, avoid=avoid)
                 avoid = None
             outcome, detail = self.register_one(email, proxy_line)
+            # 临时邮箱切换过的话，detail 里的 email 才是最终成功的那个，
+            # 后续 tried 标记 / 传输重试都按最终邮箱走，别再记旧邮箱。
+            email = detail.get("email") or email
             message = json.dumps(detail, ensure_ascii=False, sort_keys=True)
             print(f"  [W{wid}] {outcome} {message}", flush=True)
             with self._lk:
