@@ -2,14 +2,19 @@
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 之前是 dirname(dirname(__file__))：从仓库外其他目录运行时会把仓库
+# 的父目录加进 sys.path，musepy 反而找不到了。example 就在仓库根目录，
+# 正确的就是它自己的目录（和 example_batch.py 一致）。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from musepy import caa, falco
 from musepy.client import MuseClient, MuseError, random_dob
+from musepy.temp_mail import TempMailError, generate_email
 
 
 def load_config(path="config.json"):
@@ -19,13 +24,48 @@ def load_config(path="config.json"):
         return json.load(f)
 
 
+def read_otp_code(path):
+    """从文件读单个 6 位验证码；文件不存在 / 内容不是 6 位数字时返回 None。
+
+    注意：这里的 otp_file 是“只含一个验证码”的文件，别和批量模式的
+    otp_file（email----otp源URL 清单）搞混。之前是
+    `otp_file and open(...).read() or input(...)`：文件句柄不关、
+    空文件会静默 fallback 到 input、非 6 位内容也会直接拿去 confirm。
+    """
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        code = f.read().strip()
+    return code if re.fullmatch(r"[0-9]{6}", code) else None
+
+
 def main():
     cfg = load_config()
 
-    email = cfg["email"]
+    email = cfg.get("email") or ""
     proxy = cfg.get("proxy") or None
     invite_code = cfg.get("invite_code") or ""
     otp_file = cfg.get("otp_file")  # 可选：从文件读取当前验证码
+    temp_mail_timeout = int(cfg.get("temp_mail_timeout", 120) or 120)
+
+    # ---- 临时邮箱（可选）：temp_mail=true 或 email 为空时自动生成 ----
+    # 生成后立刻快照收件箱（正常为空），send 之后只认快照外的新码。
+    mail = None
+    seen_before = ()
+    if cfg.get("temp_mail") or not email:
+        try:
+            email, mail = generate_email(
+                domains=cfg.get("temp_mail_domains"),
+                proxy=proxy,
+                impersonate=cfg.get("impersonate", "chrome142"),
+            )
+        except TempMailError as exc:
+            raise SystemExit(f"临时邮箱生成失败: {exc}（请检查网络/代理，或改填 email 走手动邮箱）")
+        try:
+            seen_before = tuple(mail.fetch_codes())
+        except TempMailError:
+            seen_before = ()
+        print(f"[0] 临时邮箱已生成  {email}")
 
     c = MuseClient(proxy=proxy, impersonate=cfg.get("impersonate", "chrome142"),
                    lang=cfg.get("lang", "ja"))
@@ -33,23 +73,60 @@ def main():
     print(f"[1] 打开首页  {email}")
     c.open_home()
 
-    print("[2] 重启注册流程")
-    c.restart()
-
     # ---- 可选的漏斗埋点 ----
-    funnel = caa.Caa(c.fp, c.lang)
-    if cfg.get("send_caa", True):
-        funnel.page_shown(c.s)
-        time.sleep(2)
-        funnel.focus(c.s)
-        time.sleep(0.5)
-        funnel.continue_clicked(c.s)
-        funnel.registration_start(c.s)
+    # waterfall_id 与 client 共用同一个，否则服务端看到两条断裂的漏斗。
+    funnel = caa.Caa(c.fp, c.lang, waterfall_id=c.waterfall_id)
 
-    print("[3] 发送验证码")
-    c.send_otp(email)
+    # 拿验证码阶段（可切换邮箱重试）：临时邮箱等不到码时，换一个新邮箱、
+    # 从 restart 重新走一遍；手动邮箱没有“换邮箱”这一说，只试一次。
+    # temp_mail_max_switches 默认 2，即最多 1 个初始邮箱 + 2 次切换。
+    max_switches = int(cfg.get("temp_mail_max_switches", 2) or 0) if mail is not None else 0
+    code = None
+    for attempt in range(max_switches + 1):
+        print(f"[2] 重启注册流程  {email}")
+        c.restart()
+        if cfg.get("send_caa", True):
+            funnel.page_shown(c.s)
+            time.sleep(2)
+            funnel.focus(c.s)
+            time.sleep(0.5)
+            funnel.continue_clicked(c.s)
+            funnel.registration_start(c.s)
 
-    code = otp_file and open(otp_file).read().strip() or input("输入收到的 6 位验证码: ").strip()
+        print("[3] 发送验证码")
+        c.send_otp(email)
+
+        # 验证码来源优先级：临时邮箱收件箱 > otp_file 文件 > 手动输入
+        if mail is not None:
+            print(f"[3.1] 等临时邮箱收件（最长 {temp_mail_timeout} 秒，"
+                  f"第 {attempt + 1}/{max_switches + 1} 个邮箱）…")
+            code = mail.wait_otp(seen_before, timeout=temp_mail_timeout)
+            if code is not None:
+                break
+            if attempt >= max_switches:
+                raise SystemExit(
+                    f"临时邮箱里没等到新验证码，已换 {max_switches} 次仍超时，"
+                    "请检查出口节点/域名是否被拦后重试")
+            # 切换：旧邮箱丢弃，换新邮箱重新 restart → send → 等码
+            old_email = email
+            try:
+                email = mail.switch_to_new_email(domains=cfg.get("temp_mail_domains"))
+            except TempMailError as exc:
+                raise SystemExit(f"切换新邮箱失败: {exc}（旧邮箱 {old_email} 已无法继续）")
+            try:
+                seen_before = tuple(mail.refresh_codes())
+            except TempMailError:
+                seen_before = ()
+            print(f"[3.2] 旧邮箱 {old_email} 没收到码，已切换到新邮箱  {email}")
+            continue
+        code = read_otp_code(otp_file)
+        if code is None:
+            if otp_file:
+                print(f"提示：{otp_file} 里没有有效的 6 位验证码，改由手动输入")
+            code = input("输入收到的 6 位验证码: ").strip()
+        break
+    if not code or not re.fullmatch(r"[0-9]{6}", code):
+        raise SystemExit("验证码必须是 6 位数字")
 
     if cfg.get("send_caa", True):
         funnel.otp_typed(c.s)
@@ -95,6 +172,9 @@ def main():
 
     print("[8] 唤醒 VM（wake_trigger=mount, open_id, away_ms=0）")
     vm = c.wake_vm()
+    if vm is None:
+        # wake 失败（vmId 解析不到或 wake 非 200）时继续兑换只会误报 invalid
+        raise MuseError("vm_unresolved")
     print(f"    vm_id = {vm}")
 
     c.stateful_sharing()
@@ -107,14 +187,16 @@ def main():
             own = c.scratch_code()
             print(f"[10] 自己的邀请码（POST invite 取回，非页面刮开）= {own}")
         else:
-            print(f"    失败原因映射: already_redeemed=本账号已用过码  "
-                  f"used_up=该码已达使用上限  invalid=码不存在")
+            print("    失败原因映射: already_redeemed=本账号已用过码  "
+                  "used_up=该码已达使用上限  invalid=码不存在")
     else:
         print("    跳过兑换")
 
     sess = c.session_cookie()
     print(f"\nhatch_sess 长度 = {len(sess or '')}")
     c.close()
+    if mail is not None:
+        mail.close()
 
 
 if __name__ == "__main__":
