@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      # 不跑 ruff format --check：历史文件还没按 black 风格统一过，
+      # 全量格式化会把这次 PR 的 diff 淹没；新文件请自觉按 ruff format 写
+      - run: python -m pytest -q
