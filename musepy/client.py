@@ -12,6 +12,7 @@ import uuid
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
 from curl_cffi import requests as cr
+import contextlib
 
 BASE = "https://muse.ai"
 
@@ -75,8 +76,12 @@ class MuseClient:
                             proxies={"http": proxy, "https": proxy} if proxy else None,
                             timeout=timeout)
         self.csrf = None
+        self.account_id = None
         self.tos_content_version = None   # confirm-otp 动态返回的服务端 TOS 版本
         self.onboarding = None            # activate_session 解析出的披露结果
+        # waterfall_id 同一账号全程固定（caa 漏斗要求同一 id 贯穿全程）：
+        # 之前 _auth_headers() 每次调用都生成新 uuid，服务端看到的是断裂的漏斗。
+        self.waterfall_id = _uuid()
 
     # ---------- 基础设施 ----------
 
@@ -90,14 +95,12 @@ class MuseClient:
     def _json(self, resp):
         try:
             return resp.json() or {}
-        except Exception:
+        except (ValueError, TypeError, AttributeError):
             return {}
 
     def close(self):
-        try:
+        with contextlib.suppress(Exception):
             self.s.close()
-        except Exception:
-            pass
 
     # ---------- 注册流程 ----------
 
@@ -120,7 +123,7 @@ class MuseClient:
         h = self._h(HEADERS_JSON)
         if self.csrf:
             h["X-Hatch-CSRF-Token"] = self.csrf
-            h["X-Hatch-Waterfall-Id"] = _uuid()
+            h["X-Hatch-Waterfall-Id"] = self.waterfall_id
             h["X-Hatch-Caa-Reg-Entry-Point"] = "login_home"
         return h
 
@@ -305,7 +308,7 @@ class MuseClient:
         if not m:
             return None
         vm_id = m.group(1)
-        self.s.post(BASE + "/api/hatch/vm/wake", impersonate=self.fp,
+        r = self.s.post(BASE + "/api/hatch/vm/wake", impersonate=self.fp,
                     headers=self._h(HEADERS_JSON),
                     data=json.dumps({"vm_id": vm_id,
                                      "retry_count": 0,
@@ -313,11 +316,18 @@ class MuseClient:
                                      "wake_trigger": "mount",
                                      "open_id": _uuid(),
                                      "away_ms": 0}))
+        # 之前这里不看 wake 的返回就直接当成功：wake 失败时兑换会误报 invalid，
+        # 调用方却以为 vm 已唤醒。非 200 一律当未唤醒，让 runner 走 vm_unresolved。
+        if r.status_code != 200:
+            return None
         return vm_id
 
     def stateful_sharing(self):
-        return self.s.post(BASE + "/api/hatch/stateful-sharing", impersonate=self.fp,
-                           headers=self._h(HEADERS_JSON), data="")
+        r = self.s.post(BASE + "/api/hatch/stateful-sharing", impersonate=self.fp,
+                        headers=self._h(HEADERS_JSON), data="")
+        if r.status_code != 200:
+            raise MuseError(f"stateful-sharing {r.status_code}: {r.text[:120]}")
+        return r
 
     # ---------- 兑换 ----------
 
@@ -329,10 +339,15 @@ class MuseClient:
         r = self.s.post(BASE + "/api/hatch/invite-code/redeem", impersonate=self.fp,
                         headers=self._h(HEADERS_JSON),
                         data=json.dumps({"code": code, "supportsRedemptionStatus": True}))
-        if r.status_code == 200 and '"success":true' in r.text:
-            return True, "redeemed"
+        # 之前用 '"success":true' 子串匹配正文：带空格的 {"success": true}、
+        # 嵌套字段里出现 success=true 都会误判/漏判。按 JSON 字段判定。
         data = self._json(r)
-        return False, data.get("reason") or f"http-{r.status_code}"
+        if r.status_code == 200 and data.get("success") is True:
+            return True, "redeemed"
+        reason = data.get("reason") or data.get("redemptionStatus")
+        if r.status_code == 200 and reason == "redeemed":
+            return True, "redeemed"
+        return False, reason or f"http-{r.status_code}"
 
     def scratch_code(self):
         """兑换成功后取回本账号已分配的邀请码。
@@ -356,8 +371,8 @@ def _flight_chunks(text):
     chunks = []
     if not isinstance(text, str):
         return chunks
-    for script in re.findall(r"<script\b[^>]*>(.*?)</script\s*>", text, re.I | re.S):
-        match = re.fullmatch(r"\s*self\.__next_f\.push\((.*)\)\s*;?\s*", script, re.S)
+    for script in re.findall(r"<script\b[^>]*>(.*?)</script\s*>", text, re.IGNORECASE | re.DOTALL):
+        match = re.fullmatch(r"\s*self\.__next_f\.push\((.*)\)\s*;?\s*", script, re.DOTALL)
         if not match:
             continue
         try:
@@ -383,13 +398,16 @@ def parse_onboarding(html):
     objects = []
 
     def collect(value):
-        if isinstance(value, dict):
-            objects.append(value)
-            for child in value.values():
-                collect(child)
-        elif isinstance(value, list):
-            for child in value:
-                collect(child)
+        # 迭代收集，不用递归：服务端返回的嵌套 JSON 很深时递归会触发
+        # RecursionError；栈式遍历对任意深度都安全。
+        stack = [value]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, dict):
+                objects.append(item)
+                stack.extend(item.values())
+            elif isinstance(item, list):
+                stack.extend(item)
 
     for row in "".join(_flight_chunks(html)).splitlines():
         row_id, separator, data = row.partition(":")
