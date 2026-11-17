@@ -1,3 +1,33 @@
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "musepy"
+version = "0.3.0"
+description = "Pure-HTTP muse.ai registration / invite-code redemption protocol client (personal study only)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Personal Use Only — see LICENSE" }
+dependencies = ["curl_cffi>=0.17.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.setuptools.packages.find]
+include = ["musepy*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test_onboarding_smoke.py", "test_runner_smoke.py", "test_fixes.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "SIM", "FURB"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试脚本要先把仓库根目录插进 sys.path 才能 import musepy，E402 在这里是故意的
+"test_*.py" = ["E402"]
