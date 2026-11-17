@@ -8,6 +8,7 @@ import json
 import re
 import time
 from datetime import datetime, timezone
+import contextlib
 
 UTC = timezone.utc
 
@@ -60,7 +61,8 @@ def wait_otp(url, after, *, timeout=45, poll_interval=0.6, request_timeout=15,
 
     - 每 poll_interval 秒 GET 一次；单次请求超时 request_timeout；
     - 总超时 timeout 秒（默认 45s）；
-    - 源返回非 200 / 非 JSON 列表 → None；网络异常向上抛（按 transport_error 处理）；
+    - 源返回非 200 / 非 JSON 列表时继续轮询到超时才返回 None；
+      网络异常向上抛（按 transport_error 处理）；
     - session_factory 可注入假会话（离线测试用），默认新建 curl_cffi Session。
     """
     if session_factory is not None:
@@ -72,19 +74,20 @@ def wait_otp(url, after, *, timeout=45, poll_interval=0.6, request_timeout=15,
     try:
         while time.monotonic() < end:
             response = session.get(url, timeout=request_timeout, headers={"accept": "*/*"})
-            if response.status_code != 200:
-                return None
-            try:
-                records = json.loads(response.text)
-            except (TypeError, ValueError):
-                return None
-            otp = select_otp(records, after)
-            if otp:
-                return otp
+            # 之前非 200 / 非 JSON 直接 return None：OTP 源一次 500 或
+            # 一次空响应就把整个 45 秒等待提前判死刑。改成继续轮询到超时，
+            # 只有超时才返回 None；网络异常仍向上抛（按 transport_error 处理）。
+            if response.status_code == 200:
+                try:
+                    records = json.loads(response.text)
+                except (TypeError, ValueError):
+                    records = None
+                if isinstance(records, list):
+                    otp = select_otp(records, after)
+                    if otp:
+                        return otp
             time.sleep(poll_interval)
         return None
     finally:
-        try:
+        with contextlib.suppress(Exception):
             session.close()
-        except Exception:
-            pass
