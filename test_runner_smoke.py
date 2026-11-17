@@ -168,7 +168,7 @@ PROXIES = ["10.0.0.1:8000:u:p", "10.0.0.2:8001:u:p", "10.0.0.3:8002:u:p"]
 
 # ---------- 用例 ----------
 
-def case_select_otp_idempotent():
+def test_select_otp_idempotent():
     before = "2026-01-01T00:00:00+00:00"
     after = "2026-01-01T00:01:00+00:00"
     records = [{"otp": "111111", "time": before},   # 早于 send 开始 → 排除
@@ -183,7 +183,7 @@ def case_select_otp_idempotent():
     assert select_otp(ok, "2026-01-01T00:02:00+00:00") is None
 
 
-def case_wait_otp_poll():
+def test_wait_otp_poll():
     after = "2026-01-01T00:00:00Z"
     responses = [
         FakeResponse(200, json.dumps([{"otp": "000000",
@@ -200,7 +200,7 @@ def case_wait_otp_poll():
     assert none is None
 
 
-def case_claim_exclusive():
+def test_claim_exclusive():
     with tempfile.TemporaryDirectory() as d:
         runner, _ = make_runner(d, EMAILS[:1], PROXIES[:2], 1, FakeClient)
         runner._proxy_claims.add(PROXIES[0])          # 其他 worker 已占用
@@ -213,7 +213,7 @@ def case_claim_exclusive():
         assert line == PROXIES[0], line               # sticky：复用自己的行
 
 
-def case_sticky_reuse_and_switch():
+def test_sticky_reuse_and_switch():
     with tempfile.TemporaryDirectory() as d:
         runner, clients = make_runner(d, EMAILS, PROXIES[:2], 3, FakeClient,
                                       codes=["C1", "C2", "C3"], max_per_ip=2)
@@ -226,7 +226,7 @@ def case_sticky_reuse_and_switch():
         assert urls[2] == other                       # 达 max_per_ip 后换到另一条
 
 
-def case_presend_retry_cap():
+def test_presend_retry_cap():
     with tempfile.TemporaryDirectory() as d:
         runner, clients = make_runner(d, EMAILS, PROXIES, 2,
                                       lambda: FakeClient(fail_stage="bootstrap"))
@@ -242,7 +242,7 @@ def case_presend_retry_cap():
         assert "e2@x.test" not in tried               # 第三个邮箱未被消耗
 
 
-def case_business_reject_stops():
+def test_business_reject_stops():
     with tempfile.TemporaryDirectory() as d:
         runner, clients = make_runner(d, EMAILS, PROXIES[:2], 2,
                                       lambda: FakeClient(redeem_ok=False),
@@ -260,7 +260,7 @@ def case_business_reject_stops():
         assert rec["last_error"].startswith("redemption_unverified"), rec
 
 
-def case_region_waitlist():
+def test_region_waitlist():
     with tempfile.TemporaryDirectory() as d:
         runner, _ = make_runner(d, EMAILS, PROXIES[:2], 2,
                                 lambda: FakeClient(waitlist=True),
@@ -274,7 +274,7 @@ def case_region_waitlist():
         assert rec["last_error"] == "region_waitlist", rec
 
 
-def case_budget_no_replenish():
+def test_budget_no_replenish():
     with tempfile.TemporaryDirectory() as d:
         runner, _ = make_runner(d, EMAILS, PROXIES[:1], 1, FakeClient, codes=["C1"])
         assert runner.summary()["queued"] == 1
@@ -287,7 +287,7 @@ def case_budget_no_replenish():
         assert not os.path.exists(record_path(d, "e2@x.test"))
 
 
-def case_record_fields_no_secrets():
+def test_record_fields_no_secrets():
     with tempfile.TemporaryDirectory() as d:
         runner, _ = make_runner(d, EMAILS[:1], PROXIES[:1], 1, FakeClient, codes=["C1"])
         runner.run()
@@ -305,15 +305,15 @@ def case_record_fields_no_secrets():
 
 
 def main():
-    tests = [("select_otp_idempotent", case_select_otp_idempotent),
-             ("wait_otp_poll", case_wait_otp_poll),
-             ("claim_exclusive", case_claim_exclusive),
-             ("sticky_reuse_and_switch", case_sticky_reuse_and_switch),
-             ("presend_retry_cap", case_presend_retry_cap),
-             ("business_reject_stops", case_business_reject_stops),
-             ("region_waitlist", case_region_waitlist),
-             ("budget_no_replenish", case_budget_no_replenish),
-             ("record_fields_no_secrets", case_record_fields_no_secrets)]
+    tests = [("select_otp_idempotent", test_select_otp_idempotent),
+             ("wait_otp_poll", test_wait_otp_poll),
+             ("claim_exclusive", test_claim_exclusive),
+             ("sticky_reuse_and_switch", test_sticky_reuse_and_switch),
+             ("presend_retry_cap", test_presend_retry_cap),
+             ("business_reject_stops", test_business_reject_stops),
+             ("region_waitlist", test_region_waitlist),
+             ("budget_no_replenish", test_budget_no_replenish),
+             ("record_fields_no_secrets", test_record_fields_no_secrets)]
     for name, fn in tests:
         fn()
         print(f"[PASS] {name}")
