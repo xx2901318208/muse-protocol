@@ -2,3 +2,19 @@ config.json
 output/
 *.log
 __pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# 敏感清单：代理、邮箱、邀请码、已尝试邮箱，绝不能进仓库
+# （之前只忽略了 config.json / output/，这些文件一旦误提交就是明文凭据）
+proxies.txt
+proxy.txt
+otp-urls.txt
+otp.txt
+codes.txt
+tried_emails.txt
+tried.txt
+otp-code.txt
